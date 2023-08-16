@@ -3,6 +3,7 @@
  *  Licensed under the MIT License. See License.txt in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
+import { CancellationTokenSource } from 'vs/base/common/cancellation';
 import { Codicon } from 'vs/base/common/codicons';
 import { KeyCode, KeyMod } from 'vs/base/common/keyCodes';
 import { ICodeEditor, isCodeEditor, isDiffEditor } from 'vs/editor/browser/editorBrowser';
@@ -24,6 +25,7 @@ import { IChatWidgetService } from 'vs/workbench/contrib/chat/browser/chat';
 import { CONTEXT_IN_CHAT_SESSION, CONTEXT_PROVIDER_EXISTS } from 'vs/workbench/contrib/chat/common/chatContextKeys';
 import { IChatCopyAction, IChatService, IChatUserActionEvent, InteractiveSessionCopyKind } from 'vs/workbench/contrib/chat/common/chatService';
 import { IChatResponseViewModel, isResponseVM } from 'vs/workbench/contrib/chat/common/chatViewModel';
+import { IMappedEditsService, RelatedContextItem } from 'vs/workbench/contrib/mappedEditsProvider/common/mappedEdits';
 import { insertCell } from 'vs/workbench/contrib/notebook/browser/controller/cellOperations';
 import { INotebookEditor } from 'vs/workbench/contrib/notebook/browser/notebookBrowser';
 import { CellKind, NOTEBOOK_EDITOR_ID } from 'vs/workbench/contrib/notebook/common/notebookCommon';
@@ -182,29 +184,30 @@ export function registerChatCodeBlockActions() {
 
 			if (editorService.activeEditorPane?.getId() === NOTEBOOK_EDITOR_ID) {
 				return this.handleNotebookEditor(accessor, editorService.activeEditorPane.getControl() as INotebookEditor, context);
-			}
+			} else {
 
-			let activeEditorControl = editorService.activeTextEditorControl;
-			if (isDiffEditor(activeEditorControl)) {
-				activeEditorControl = activeEditorControl.getOriginalEditor().hasTextFocus() ? activeEditorControl.getOriginalEditor() : activeEditorControl.getModifiedEditor();
-			}
+				let activeEditorControl = editorService.activeTextEditorControl;
+				if (isDiffEditor(activeEditorControl)) {
+					activeEditorControl = activeEditorControl.getOriginalEditor().hasTextFocus() ? activeEditorControl.getOriginalEditor() : activeEditorControl.getModifiedEditor();
+				}
 
-			if (!isCodeEditor(activeEditorControl)) {
-				return;
-			}
+				if (!isCodeEditor(activeEditorControl)) {
+					return;
+				}
 
-			const activeModel = activeEditorControl.getModel();
-			if (!activeModel) {
-				return;
-			}
+				const activeModel = activeEditorControl.getModel();
+				if (!activeModel) {
+					return;
+				}
 
-			// Check if model is editable, currently only support untitled and text file
-			const activeTextModel = textFileService.files.get(activeModel.uri) ?? textFileService.untitled.get(activeModel.uri);
-			if (!activeTextModel || activeTextModel.isReadonly()) {
-				return;
-			}
+				// Check if model is editable, currently only support untitled and text file
+				const activeTextModel = textFileService.files.get(activeModel.uri) ?? textFileService.untitled.get(activeModel.uri);
+				if (!activeTextModel || activeTextModel.isReadonly()) {
+					return;
+				}
 
-			await this.handleTextEditor(accessor, activeEditorControl, activeModel, context);
+				await this.handleTextEditor(accessor, activeEditorControl, activeModel, context);
+			}
 		}
 
 		private async handleNotebookEditor(accessor: ServicesAccessor, notebookEditor: INotebookEditor, context: IChatCodeBlockActionContext) {
@@ -232,17 +235,30 @@ export function registerChatCodeBlockActions() {
 			this.notifyUserAction(accessor, context);
 		}
 
-		private async handleTextEditor(accessor: ServicesAccessor, codeEditor: ICodeEditor, activeModel: ITextModel, context: IChatCodeBlockActionContext) {
-			this.notifyUserAction(accessor, context);
+		private async handleTextEditor(accessor: ServicesAccessor, codeEditor: ICodeEditor, activeModel: ITextModel, chatCodeBlockActionContext: IChatCodeBlockActionContext) {
+			this.notifyUserAction(accessor, chatCodeBlockActionContext);
 			const bulkEditService = accessor.get(IBulkEditService);
 			const codeEditorService = accessor.get(ICodeEditorService);
+			const mappedEditsService = accessor.get(IMappedEditsService);
 
-			const activeSelection = codeEditor.getSelection() ?? new Range(activeModel.getLineCount(), 1, activeModel.getLineCount(), 1);
-			await bulkEditService.apply([new ResourceTextEdit(activeModel.uri, {
-				range: activeSelection,
-				text: context.code,
-			})]);
+			// try applying workspace edit that was returned by a MappedEditsProvider, else simply insert at selection
 
+			const selections = codeEditor.getSelections() ?? [];
+			const mappedEditsContext = {
+				selections,
+				related: [] as RelatedContextItem[], // FIXME@ulugbekna: this needs to be populated but we don't yet have a way to get this info from extensions
+			};
+			const cancellationTokenSource = new CancellationTokenSource();
+			const workspaceEdit = await mappedEditsService.provideMappedEdits(activeModel, [chatCodeBlockActionContext.code], mappedEditsContext, cancellationTokenSource.token);
+			if (workspaceEdit) {
+				await bulkEditService.apply(workspaceEdit);
+			} else {
+				const activeSelection = codeEditor.getSelection() ?? new Range(activeModel.getLineCount(), 1, activeModel.getLineCount(), 1);
+				await bulkEditService.apply([new ResourceTextEdit(activeModel.uri, {
+					range: activeSelection,
+					text: chatCodeBlockActionContext.code,
+				})]);
+			}
 			codeEditorService.listCodeEditors().find(editor => editor.getModel()?.uri.toString() === activeModel.uri.toString())?.focus();
 		}
 
